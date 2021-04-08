@@ -1,0 +1,15 @@
+FROM alpine
+
+MAINTAINER wangxi
+
+LABEL vendor=rsync
+
+RUN echo "https://mirrors.ustc.edu.cn/alpine/latest-stable/main" > /etc/apk/repositories
+RUN echo "https://mirrors.ustc.edu.cn/alpine/latest-stable/community" >> /etc/apk/repositories
+
+RUN apk update
+RUN apk add net-tools
+RUN apk add rsync
+RUN apk add curl
+
+CMD ["sh"]
