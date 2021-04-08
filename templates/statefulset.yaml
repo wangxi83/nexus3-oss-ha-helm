@@ -1,0 +1,215 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ template "nexus.fullname" . }}
+  labels:
+    app: {{ template "nexus.name" . }}
+    chart: {{ template "nexus.chart" . }}
+    release: {{ .Release.Name }}
+spec:
+  serviceName: {{ template "nexus.headless" . }}
+  # 限定zk的数量为3
+  replicas: {{ .Values.replicaCount }}
+  # 重要。必须OrderedReady
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: {{ template "nexus.name" . }}
+      release: {{ .Release.Name }}
+  updateStrategy:
+    type: {{ .Values.nexus.updateStrategy }}
+  template:
+    metadata:
+      labels:
+        app: {{ template "nexus.name" . }}
+        release: {{ .Release.Name }}
+      annotations:
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+{{ toYaml .Values.securityContext | indent 8 }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: "{{ .Values.priorityClassName }}"
+      {{- end }}
+      {{- if .Values.nodeSelector }}
+      nodeSelector:
+        {{- $labels := regexSplit "," .Values.nodeSelector -1 }}
+        {{- range $labels }}
+        {{ . | replace "=" ": " }}
+        {{- end }}
+      {{- end }}
+      {{- if .Values.hardAntiAffinity }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: {{ template "nexus.name" . }}
+                  chart: {{ template "nexus.chart" . }}
+                  release: {{ .Release.Name }}
+              topologyKey: kubernetes.io/hostname
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: {{ template "nexus.name" . }}
+                    chart: {{ template "nexus.chart" . }}
+                    release: {{ .Release.Name }}
+                topologyKey: failure-domain.beta.kubernetes.io/zone
+      {{- end }}
+      {{/* 创建 serviceAccount，通过该账户访问kube api，修改pod标签 */}}
+      serviceAccountName: "{{ printf "%s%s" ( include "nexus.fullname" . ) "-apiuser"  }}"
+      containers:
+      - name: nexus3
+        {{- if eq .Values.image.arch "x86" }}
+        image: {{ .Values.image.registry }}/{{ .Values.image.nexus.repository_x86 }}:{{ .Values.image.nexus.tag_x86 }}
+        {{- else }}
+        image: {{ .Values.image.registry }}/{{ .Values.image.nexus.repository_arm64 }}:{{ .Values.image.nexus.tag_arm64 }}
+        {{- end }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        # 官方容器是以nexus用户运行，这样就需要在主机上chown来修改数据目录。这里直接改为用root账户运行
+        securityContext:
+          runAsUser: 0
+        livenessProbe:
+#          httpGet:
+#            path: /
+#            port: nexus
+#            scheme: HTTP
+          exec:
+            command:  ["sh", "/root/check_info.sh"]
+          initialDelaySeconds: 45
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 20
+          successThreshold: 1
+        readinessProbe:
+#          httpGet:
+#            path: /
+#            port: nexus
+#            scheme: HTTP
+          exec:
+            command:  ["sh", "/root/check_info.sh"]
+          initialDelaySeconds: 40
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 20
+          successThreshold: 1
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        command:
+        - bash
+        - /root/run.sh
+        ports:
+        - name: nexus
+          containerPort: {{ .Values.nexus.port }}
+        resources:
+          {{- if .Values.nexus.resources.requests.enabled }}
+          requests:
+            cpu: {{ .Values.nexus.resources.requests.cpu }}m
+            memory: {{ .Values.nexus.resources.requests.memory }}Mi
+          {{- end }}
+          {{- if .Values.nexus.resources.limits.enabled }}
+          limits:
+            cpu: {{ .Values.nexus.resources.limits.cpu }}m
+            memory: {{ .Values.nexus.resources.limits.memory }}Mi
+          {{- end }}
+        volumeMounts:
+        - mountPath: {{ .Values.nexus.persistence.mountPath }}
+          name: nexusworkspace
+          subPathExpr: $(POD_NAME)/nexus-data
+        - mountPath: /root/run.sh
+          name: config-map
+          subPath: run.sh
+        - mountPath: /root/check_info.sh
+          name: config-map
+          subPath: check_info.sh
+      - name: check-status
+        {{- if eq .Values.image.arch "x86" }}
+        image: {{ .Values.image.registry }}/{{ .Values.image.rsync.repository_x86 }}:{{ .Values.image.rsync.tag_x86 }}
+        {{- else }}
+        image: {{ .Values.image.registry }}/{{ .Values.image.rsync.repository_arm64 }}:{{ .Values.image.rsync.tag_arm64 }}
+        {{- end }}
+        imagePullPolicy: {{ .Values.imagePullPolicy | quote }}
+        restartPolicy: Never
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        # 定时检查当前POD是否需要设置为status=UP
+        command:
+        - sh
+        - /root/initial.sh
+        volumeMounts:
+        - mountPath: {{ .Values.nexus.persistence.mountPath }}
+          name: nexusworkspace
+          subPathExpr: $(POD_NAME)/nexus-data
+        - mountPath: {{ .Values.nexus.rsync.mountPath }}
+          name: nexusworkspace
+          subPathExpr: $(POD_NAME)/rsync
+        - mountPath: /root/initial.sh
+          name: config-map
+          subPath: initial.sh
+        - mountPath: /root/rsync.conf
+          name: config-map
+          subPath: rsync.conf
+      # 存储卷设置
+      volumes:
+      - name: config-map
+        configMap:
+          name: {{ template "nexus.fullname" . }}
+          items:
+          - key: run.sh
+            path: run.sh
+          - key: initial.sh
+            path: initial.sh
+          - key: rsync.conf
+            path: rsync.conf
+          - key: check_info.sh
+            path: check_info.sh
+      ############### 存储卷或存储卷模板设置  ###########################
+{{/* 判断存储类型 */}}
+{{- if not .Values.nexus.persistence.claim  }}
+{{-   if .Values.nexus.persistence.hostPath }}
+      - name: nexusworkspace
+        hostPath:
+          path: {{ .Values.nexus.persistence.hostPath }}
+          type: DirectoryOrCreate
+{{-   else }}
+      - name: nexusworkspace
+        emptyDir: {}
+{{-   end  }}
+{{- else }}
+  volumeClaimTemplates:
+  - metadata:
+      name: nexusworkspace
+    spec:
+      accessModes:
+{{-     range .Values.nexus.persistence.accessModes }}
+      - {{ . | quote }}
+{{-     end }}
+      resources:
+        requests:
+          storage: "{{ .Values.nexus.persistence.size }}Gi"
+{{-     if .Values.nexus.persistence.storageClass }}
+{{-       if (eq "-" .Values.nexus.persistence.storageClass) }}
+      storageClassName: ""
+{{-       else }}
+      storageClassName: "{{ .Values.nexus.persistence.storageClass }}"
+{{-       end }}
+{{-     end }}
+{{- end }}

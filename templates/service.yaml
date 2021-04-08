@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ template "nexus.headless" . }}
+  labels:
+    app: {{ template "nexus.name" . }}
+    chart: {{ template "nexus.chart" . }}
+    release: {{ .Release.Name }}
+  annotations:
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  ports:
+  - name: nexus
+    port: {{ .Values.nexus.port }}
+    targetPort: nexus
+    protocol: TCP
+  {{- if gt (int .Values.replicaCount ) 1 }}
+  - name: rsync
+    port: {{ .Values.nexus.rsync.port }}
+    targetPort: rsync
+    protocol: TCP
+  {{- end }}
+  selector:
+    app: {{ template "nexus.name" . }}
+    release: {{ .Release.Name }}
+---
+# 集群内部负载均衡
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ template "nexus.name" . }}
+  labels:
+    app: {{ template "nexus.name" . }}
+    chart: {{ template "nexus.chart" . }}
+    release: {{ .Release.Name }}
+  annotations:
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  ports:
+  - name: dr
+    port: {{ .Values.nexus.port }}
+    targetPort: dr
+    protocol: TCP
+  selector:
+    app: {{ template "nexus.name" . }}
+    release: {{ .Release.Name }}
+    status: UP
+{{/* 启用nodeport */}}
+{{- if .Values.nexus.nodePort.enabled }}
+---
+# nodeport
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus-np
+  labels:
+    app: {{ template "nexus.name" . }}
+    chart: {{ template "nexus.chart" . }}
+    release: {{ .Release.Name }}
+spec:
+  type: NodePort
+  ports:
+  - name: nexus-np
+    port: {{ .Values.nexus.port }}
+    protocol: TCP
+    targetPort: nexus
+    nodePort: {{ .Values.nexus.nodePort.port }}
+  selector:
+    app: {{ template "nexus.name" . }}
+    release: {{ .Release.Name }}
+    status: UP
+{{- end }}
