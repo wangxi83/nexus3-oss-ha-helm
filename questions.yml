@@ -1,0 +1,222 @@
+labels:
+  io.cattle.role: project # options are cluster/project
+  io.rancher.app_min_version: 0.1.0
+categories:
+- nexus3
+questions:
+# -------------------    安装目标     -----------------------
+- variable: replicaCount
+  group: "安装控制"
+  default: 2
+  description: "集群实例数量，默认为2。可选1-2"
+  type: enum
+  options:
+    - 1
+    - 2
+  label: "集群实例数量，1-3可选"
+- variable: hardAntiAffinity
+  group: "安装控制"
+  default: true
+  description: "强制pod分布到不同节点，如果关闭，不同pod可能散落在相同节点，默认【开启】"
+  label: "节点反亲和开关"
+  type: enum
+  show_if: "replicaCount!=1"
+  options:
+    - true
+    - false
+# #################  镜像相关  ##################
+- variable: image.registry
+  group: "镜像选择"
+  default: "opendata.sobeylingyun.com"
+  description: "镜像服务器地址"
+  type: enum
+  required: true
+  label: 镜像服务器地址
+  options:
+    - "opendata.sobeylingyun.com"
+    - "harbor.sobey.com"
+- variable: image.arch
+  group: "镜像选择"
+  default: "x86"
+  description: "CPU架构"
+  type: enum
+  required: true
+  label: CPU架构
+  options:
+    - "x86"
+    - "arm64"
+# -------------------  用户密码  -----------------------
+- variable: nexus.auth.user
+  default: "sobey"
+  group: "【账户】相关配置"
+  description: "用户名"
+  type: string
+  required: true
+  label: "用户名"
+- variable: nexus.auth.password
+  default: "SobeyHive2016"
+  group: "【账户】相关配置"
+  description: "密码"
+  type: string
+  required: true
+  label: "密码"
+# #################  存储相关  ##################
+# --------  nexus-data存放配置 -----------------
+- variable: nexus.persistence.claim
+  group: "【nexus-data#存储】相关配置"
+  default: false
+  label: 是否开启nexus-data的存储模板，【开启之后，基于rsync的同步不再起作用】。请认真确认你是否要开！！
+  description: "是否开启nexus-data的存储模板，开启后，将通过PVC分配存储。【注意！！开启之后，基于rsync的同步不再起作用】"
+  type: enum
+  options:
+    - true
+    - false
+  required: false
+  show_subquestion_if: true
+  subquestions:
+  - variable: nexus.persistence.size
+    default: 10
+    description: "存储模板需求的空间，单位Gi"
+    type: int
+    required: true
+    label: "存储模板需求的空间，单位Gi"
+  - variable: nexus.persistence.storageClass
+    default: ""
+    description: "存储模板绑定的存储类。如果需要的话，可以配置存储类名称"
+    type: string
+    required: false
+    label: "存储模板绑定的存储类。默认可以不管"
+# --------  blob存放配置 -----------------
+- variable: nexus.persistence.blob.storageType
+  group: "【blob#存储】相关配置"
+  default: storage
+  label: 存储方式安泽
+  description: "存储方式选择，【storage|minio】"
+  type: enum
+  options:
+    - storage
+    - minio
+# ---------- blob存放配置-minio 相关 --------
+- variable: nexus.persistence.blob.minio.regionendpoint
+  group: "【blob#存储】相关配置"
+  description: "Minio的地址，集群内应该使用minio服务ClusterIP的地址。一定要写正确，最后不要留'/'。比如：http://xxxxxx:9000。【【特别注意：如果要集群外访问，这里填nodeport地址】】"
+  type: string
+  required: true
+  label: "Minio的地址。一定要写正确，最后不要留'/'。比如：http://xxxxxx:9000。【【特别注意：如果要集群外访问，这里填nodeport地址】】"
+  show_if: "nexus.persistence.blob.storageType=minio"
+- variable: nexus.persistence.blob.minio.bucketMaven
+  default: "maven-ficuspi"
+  group: "【blob#存储】相关配置"
+  description: "在Minio上创建的Maven库bucket"
+  type: string
+  required: true
+  label: "在Minio上创建的Maven库bucket"
+  show_if: "nexus.persistence.blob.storageType=minio"
+- variable: nexus.persistence.blob.minio.bucketPypi
+  default: "pypi-ficuspi"
+  group: "【blob#存储】相关配置"
+  description: "在Minio上创建的Py库bucket"
+  type: string
+  required: true
+  label: "在Minio上创建的Py库bucket"
+  show_if: "nexus.persistence.blob.storageType=minio"
+- variable: nexus.persistence.blob.minio.accessKey
+  group: "【blob#存储】相关配置"
+  description: "Minio的AccessKey"
+  default: "3SVYFQKNIKD59KA7VOS3"
+  type: string
+  required: true
+  label: "Minio的AccessKey"
+  show_if: "nexus.persistence.blob.storageType=minio"
+- variable: nexus.persistence.blob.minio.secretKey
+  group: "【blob#存储】相关配置"
+  description: "Minio的SecretKey"
+  default: "3SGTJSM5gQOMQ7Lo+iD+oRar9mqjHoT3gqlcH0S3"
+  type: string
+  required: true
+  label: "Minio的SecretKey"
+  show_if: "nexus.persistence.blob.storageType=minio"
+# --------   hostpath设置 -----------------
+- variable: nexus.persistence.hostPath
+  group: "【主机路径】相关配置"
+  default: /var/lib/kubelet/nexusworkspace
+  description: "hostPath路径。注意，如果是RKE（比如单机rancher），一定要使用/var/lib/kubelet/下的目录"
+  type: string
+  required: false
+  label: "hostPath路径。特别注意是否是RKE环境"
+  show_if: "nexus.persistence.claim=false"
+# ################   资源控制相关   ############
+- variable: nexus.resources.requests.enabled
+  label: 最小调度资源请求
+  group: "【nexus#资源控制】相关配置"
+  default: false
+  description: "开启资源控制，资源满足此请求设置大小，POD才被调度"
+  type: enum
+  options:
+    - true
+    - false
+  required: false
+  show_subquestion_if: true
+  subquestions:
+  - variable: nexus.resources.requests.cpu
+    default: 100
+    description: "CPU的计量单位，以毫核(m)为准。一个节点的CPU核心数量乘以1000，得到的就是节点总的CPU总数量。1核=1000m"
+    type: int
+    required: true
+    label: "最小调度CPU毫核数"
+  - variable: nexus.resources.requests.memory
+    default: 128
+    description: "最小调度内存，单位Mi"
+    type: int
+    required: true
+    label: "最小调度内存，单位M"
+- variable: nexus.resources.limits.enabled
+  label: 最大资源限制
+  group: "【nexus#资源控制】相关配置"
+  default: false
+  description: "开启最大资源限制，当超过此资源，容器将触发OOM或CPU异常"
+  type: enum
+  options:
+    - true
+    - false
+  required: false
+  show_subquestion_if: true
+  subquestions:
+  - variable: nexus.resources.limits.cpu
+    default: 2000
+    description: "CPU的计量单位，以毫核(m)为准。1核=1000m"
+    type: int
+    required: true
+    label: "CPU最大分配毫核数"
+  - variable: nexus.resources.limits.memory
+    default: 2048
+    description: "最大内存分配，单位Mi"
+    type: int
+    required: true
+    label: "最大内存分配，单位M"
+# #################  nodeport相关##################
+- variable: nexus.nodePort.enabled
+  label: 是否开启nodeport
+  group: "【nexus#NodePort】相关配置"
+  default: false
+  description: "是否开启nodeport"
+  type: enum
+  options:
+    - true
+    - false
+  required: false
+  show_subquestion_if: true
+  subquestions:
+  - variable: nexus.nodePort.port
+    default: 32081
+    description: "nexus的nodeport"
+    type: int
+    required: true
+    label: "nexus的nodeport"
+################### 节点选择 ######################
+- variable: nodeSelector
+  label: 节点选择标签，逗号分隔。例如：【node=test,type=ssh】
+  group: "节点选择标签设置"
+  description: "节点选择标签，设置以后，将分配POD到对应标签的节点上。配置样例：【node=test,type=ssh】。"
+  type: string
+  required: false

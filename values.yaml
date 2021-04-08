@@ -1,0 +1,125 @@
+# ------------------------------------------------------------------------------
+
+image:
+  registry: opendata.sobeylingyun.com
+  arch: "x86"
+  nexus:
+    repository_x86: ficus/nexus3
+    repository_arm64: ficus-arm/nexus3
+    tag_x86: "3.24.0"
+    tag_arm64: "3.24.0"
+  rsync:
+     repository_x86: ficus/rsync
+     repository_arm64: ficus-arm/rsync
+     tag_x86: "1.0"
+     tag_arm64: "1.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+nexus:
+  podNameOverride: "nexus3"
+  port: 8081
+  ## ref: https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#update-strategies
+  updateStrategy: "RollingUpdate"
+  # 资源控制
+  resources:
+    requests:
+      enabled: false
+      # CPU的计量单位,以毫核(m)为准。一个节点的CPU核心数量乘以1000，得到的就是节点总的CPU总数量。如，一个节点有两个核，那么该节点的CPU总量为2000m。
+      cpu: 100
+      # 内存计量单位，始终以兆（Mi）为准
+      memory: 128
+    limits:
+      enabled: false
+      cpu: 2000
+      memory: 2048
+  # 用户配置
+  auth:
+    user: sobey
+    password: SobeyHive2016
+  # 存储设置
+  persistence:
+    hostPath: /var/lib/kubelet/nexusworkspace
+    # nexus数据的存放
+    claim: false
+    # 单位Gi
+    size: 10
+    annotations: {}
+    mountPath: /nexus-data
+    storageClass: "-"
+    accessModes:
+    - ReadWriteOnce
+    # blob的存放
+    blob:
+      name: "ficuspi"
+      typeEnum:
+      - storage
+      - minio
+      # 如果type是storage，则使用nexusdata配置
+      storageType: storage
+      minio:
+        accessKey: "3SVYFQKNIKD59KA7VOS3"
+        secretKey: "3SGTJSM5gQOMQ7Lo+iD+oRar9mqjHoT3gqlcH0S3"
+        #region参数可随意
+        region: us-east-1
+        #minio的9000访问地址，集群内可以使用ClusterIP
+        regionendpoint:
+        bucketMaven: "maven-ficuspi"
+        bucketPy: "pypi-ficuspi"
+  # 需要管理的仓库
+  managedRepo:
+    java:
+      group: sobeyhive-group
+      local: ficus
+      proxy:
+        name: aliyun
+        url: https://maven.aliyun.com/repository/public
+    python:
+      group: pypi-sobey
+      local: pypi-local
+      proxy:
+        name: pypi-douban
+        url: https://mirrors.aliyun.com/pypi/
+  # nodeport
+  nodePort:
+    enabled: false
+    port: 32081
+  #### 使用rsync来同步nexus的nexus-data数据
+  rsync:
+    moduleName: nexusdata
+    mountPath: /var/log
+    port: 873
+#
+#  --daemon                 run as an rsync daemon
+#  --address=ADDRESS        bind to the specified address
+#  --bwlimit=RATE           limit socket I/O bandwidth
+#  --config=FILE            specify alternate rsyncd.conf file
+#  --dparam=OVERRIDE, -M    override global daemon config parameter
+#  --no-detach              do not detach from the parent
+#  --port=PORT              listen on alternate port number
+#  --log-file=FILE          override the "log file" setting
+#  --log-file-format=FMT    override the "log format" setting
+#  --sockopts=OPTIONS       specify custom TCP options
+#  --verbose, -v            increase verbosity
+#  --ipv4, -4               prefer IPv4
+#  --ipv6, -6               prefer IPv6
+
+
+#####  其他共用配置（暂时） ##########
+## Start and stop pods in Parallel or OrderedReady (one-by-one.)  Note - Can not change after first release.
+## ref: https://kubernetes.io/docs/tutorials/stateful-application/basic-stateful-set/#pod-management-policy
+podManagementPolicy: Parallel
+
+
+## Node labels for pod assignment
+## ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector
+nodeSelector: {}
+
+
+## Period to wait for broker graceful shutdown (sigterm) before pod is killed (sigkill)
+## ref: https://kubernetes-v1-4.github.io/docs/user-guide/production-pods/#lifecycle-hooks-and-termination-notice
+## ref: https://kafka.apache.org/10/documentation.html#brokerconfigs controlled.shutdown.*
+terminationGracePeriodSeconds: 60
+
+debug: false
