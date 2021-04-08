@@ -1,0 +1,470 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ template "nexus.fullname" . }}
+  labels:
+    app: {{ template "nexus.name" . }}
+    chart: {{ template "nexus.chart" . }}
+    release: {{ .Release.Name }}
+data:
+  # rsync的服务进程配置
+  # 配置项参考：官网：https://download.samba.org/pub/rsync/rsyncd.conf.5
+  # 配置项参考：https://my.oschina.net/ccLlinux/blog/1859116
+  rsync.conf: |-
+    port={{ .Values.nexus.rsync.port }}
+    log file=/var/log/rsync.log
+    pid file=/var/run/rsyncd.pid
+    address=0.0.0.0
+    [{{ .Values.nexus.rsync.moduleName }}]
+    path={{ .Values.nexus.persistence.mountPath }}
+    use chroot=false
+    list=true
+    read only=false
+    uid=root
+    gid=root
+  run.sh: |-
+    #!/bin/bash
+
+    # 由于在statefulset中的container使用了root账户，这里需要参考官方的Dockerfile重设环境变量
+    export SONATYPE_DIR=/opt/sonatype
+    export NEXUS_HOME=${SONATYPE_DIR}/nexus
+    export NEXUS_DATA={{ .Values.nexus.persistence.mountPath }}
+    export NEXUS_CONTEXT=''
+    export SONATYPE_WORK=${SONATYPE_DIR}/sonatype-work
+    export DOCKER_TYPE='rh-docker'
+    {{- if .Values.nexus.resources.limits.enabled }}
+    {{/*如果设置了资源，则jvm大小为其3/4*/}}
+    {{- $memory := div (mul .Values.nexus.resources.limits.memory 3) 4 }}
+    export JVM_SIZE={{ printf "%dm" $memory | quote }}
+    {{- else }}
+    export JVM_SIZE="2703m"
+    {{- end }}
+
+    if_start_standby() {
+      while true; do
+        # 因为这个容器没有curl，因此状态判断是来自于辅助容器中initial.sh写入的文件数据
+        if [ -f {{ .Values.nexus.persistence.mountPath }}/pod_status ] && [ $(cat {{ .Values.nexus.persistence.mountPath }}/pod_status) == "UP" ]; then
+          echo "启动备服务...."
+          # 启动脚本参考官方容器启动入口，只不过 sh -c 改为 flock -c
+          export INSTALL4J_ADD_VM_PARAMS="-Xms${JVM_SIZE} -Xmx${JVM_SIZE} -XX:MaxDirectMemorySize=${JVM_SIZE} -Djava.util.prefs.userRoot=${NEXUS_DATA}/javaprefs"
+          # 加锁执行(在initial.sh中，会互斥这个锁)
+          flock -x {{ .Values.nexus.persistence.mountPath }}/sync.lock -c "${SONATYPE_DIR}/start-nexus-repository-manager.sh"
+        fi
+        # 每2秒执行一次
+        sleep 2
+      done
+    }
+
+    podnumber=${POD_NAME:0-1}
+    if [ "`expr $podnumber + 1`" -gt "{{ .Values.replicaCount }}" ]; then
+      echo "启动数量超出集群数量设置：{{ .Values.replicaCount }}, 不能启动"
+      exit 1
+    fi
+
+    # 判断状态文件是否存在，如果不存在，则表示是完全新启动；如果存在，则表示是重启
+    if [ -f {{ .Values.nexus.persistence.mountPath }}/_run ]; then
+      # 直接进入standby状态。删除状态文件，等待initial.sh刷新新的状态文件
+      # 这样的效果：
+      # 1.如果节点全部重启，都会一直处于standby。这时候应该手动启动其中一个节点，它直接成为UP节点。其他检查到这个节点启动以后，会进入冷备启动状态
+      # 2.如果其中一个节点重启，则这个节点先进入standby状态，然后进入节点检查。检查到其他节点是UP（一定会有），则进入冷备启动状态
+      # 由于该容器没有Curl，因此上述逻辑是在辅助容器的initial.sh中执行的(@see initial.sh 启动逻辑)，然后通过共享文件来传递信息到这里
+      echo "节点重启，直接进入standby状态....."
+      rm -fr {{ .Values.nexus.persistence.mountPath }}/pod_status
+      if_start_standby
+    else
+      # 写状态文件
+      echo "UP" > {{ .Values.nexus.persistence.mountPath }}/_run
+      # 对于全新构建，则以0号节点为主节点
+      if [ $podnumber = "0" ]; then
+        # 如果是主节点，直接启动。参考官方容器启动入口
+        export INSTALL4J_ADD_VM_PARAMS="-Xms${JVM_SIZE} -Xmx${JVM_SIZE} -XX:MaxDirectMemorySize=${JVM_SIZE} -Djava.util.prefs.userRoot=${NEXUS_DATA}/javaprefs"
+        sh -c "${SONATYPE_DIR}/start-nexus-repository-manager.sh"
+      else
+        # 如果是从节点，则从主节点同步数据。但是不启动（因为nexus会定时构建es索引，冷启动反而是好事），等主节点检测不到了再启动
+        if_start_standby
+      fi
+    fi
+  # 启动后，主节点通过api接口初始化nexus配置，并且启动rsync同步服务；从节点通过rsync从主节点同步数据
+  initial.sh: |-
+    #!/bin/bash
+
+    sync_data_from() {
+      local pod_number=${1-0} # 默认为0号
+      rsycn_target={{ include "nexus.fullname" . }}-${pod_number}.{{ include "nexus.headless" . }}
+      result=$(rsync rsync://${rsycn_target}:{{ .Values.nexus.rsync.port }} 2>&1|grep {{ .Values.nexus.rsync.moduleName }} |wc -l)
+      if [ "${result}" -eq 1 ]; then
+        echo "[sync_data_from]目标节点{{ include "nexus.fullname" . }}-${pod_number}同步模块已获取，开始同步数据....."
+        syncdone=0
+        # 这里加锁执行，和run.sh互斥。
+        # 但是因为run.sh中，flock执行的命令是start-nexus-repository-manager.sh，这个不会退出。因此这里加了-n参数，并且做了try catch处理
+        set +e
+        # 下面的同步命令形式为：rsync -av --port 873 ip::[source] [target]
+        while true; do
+          if [ ${time} -gt 15 ]; then
+            echo "[sync_data_from]尝试15次，无法正确同步数据，需要手动检查。。。。退出，等待下一次调度"
+            return 0
+          fi
+          # 如果本地的nexus已经启动，说明它是UP状态，则不再同步
+          # 这里之所以可以这么判断，因为下面的同步处理是加锁的，而nexus启动脚本不会退出，会持续占用锁，因此在启动中，后面的同步其实不会成功，意味着nexus一定会启动起来
+          result=$(curl --connect-timeout 1 -I http://127.0.0.1:${port} | grep 200 |wc -l)
+          if [ "${result}" -eq 1 ]; then
+            echo "[sync_data_from]本地nexus已启动，不再从其他节点同步"
+            return 0
+          fi
+
+          {
+
+            echo "尝试加锁{{ .Values.nexus.persistence.mountPath }}/sync.lock同步数据" && \
+            set -x && \
+            flock -xn {{ .Values.nexus.persistence.mountPath }}/sync.lock -c "rsync -av --port {{ .Values.nexus.rsync.port }} --exclude 'log' --exclude 'karaf.pid' --exclude 'lock' --exclude 'port' --exclude 'tmp' --exclude '_run' --exclude '_initial' --exclude 'pod_status' ${rsycn_target}::{{ .Values.nexus.rsync.moduleName }}/ {{ .Values.nexus.persistence.mountPath }}" && \
+            set +x && \
+            echo "同步完成" && \
+            return 0
+          } || {
+
+            echo "{{ .Values.nexus.persistence.mountPath }}/sync.lock被占用，可能是nexus正在启动，等待2秒" && \
+            sleep 2
+          }
+          let "time++"
+        done
+        set -e
+      else
+        echo "没有正确获取到节点{{ include "nexus.fullname" . }}-${pod_number}的rsync同步服务和模块，等待下一次调度。。。"
+      fi
+    }
+
+    # 检查状态，返回：1异常，0正常
+    # 注意，调用的时候需要 set +e
+    check_status_from() {
+      local pod_number=${1-0} # 默认为0号
+      echo ""
+      echo "=========[check_status_from]检查{{ include "nexus.fullname" . }}-${pod_number}健康度======="
+      target={{ include "nexus.fullname" . }}-${pod_number}.{{ include "nexus.headless" . }}
+      # 检查UP节点的状态，决定自己是否需要UP
+      checktime=0
+      health_level=0 # 健康等级。health_level(0-100) = n*ping(1) + m*nexus(10) + t*rsync(2) ， 其中n=6 (6%)， m=8 (80%),  t=7 (14%)
+      while [ ${checktime} -lt 5 ]; do
+        n=0
+        m=0
+        t=0
+        while [ ${n} -lt 6 ] || [ ${m} -lt 8 ] || [ ${t} -lt 7 ]; do
+          # 1、检查ping
+          if [ ${n} -lt 6 ]; then
+            result=$(timeout 2 ping -c 1 -w 2 ${target}|grep "1 packets transmitted, 1 packets received"|wc -l)
+            if [ "${result}" -eq 1 ]; then
+              health_level=$((${health_level}+1))
+            fi
+            let "n++"
+          fi
+          # 2、检查nexus服务
+          if [ ${m} -lt 8 ]; then
+            result=$(curl --connect-timeout 1 -I http://${target}:{{ .Values.nexus.port }} | grep 200 |wc -l)
+            if [ "${result}" -eq 1 ]; then
+              health_level=$((${health_level}+10))
+            fi
+            let "m++"
+          fi
+          # 3、检查rsync服务
+          if [ ${t} -lt 7 ]; then
+            result=$(rsync rsync://${rsycn_target}:{{ .Values.nexus.rsync.port }} 2>&1|grep {{ .Values.nexus.rsync.moduleName }} |wc -l)
+            if [ "${result}" -eq 1 ]; then
+              health_level=$((${health_level}+2))
+            fi
+            let "t++"
+          fi
+        done
+        let "checktime++"
+        sleep 1
+      done
+
+      health_level=$((${health_level}/5))
+      echo "${pod_number}号节点健康度检查结果为: ${health_level}"
+      if [ ${health_level} -gt 75 ]; then
+        return 0
+      else
+        return 1
+      fi
+    }
+
+    # 从节点启动后的逻辑
+    stand_by_from() {
+      local up_pod=${1-0} # 默认为0号
+      while true; do
+        success=0
+        for i in `seq 3`; do
+          set +e
+          echo "检查${up_pod}节点状态..."
+          check_status_from ${up_pod}
+          if [ $? -eq 0 ]; then
+            let "success++"
+          fi
+          set -e
+          sleep 1
+        done
+        echo "检查UP节点：${up_pod}号节点状态3次，成功${success}次..."
+        if [ ${success} -lt 3 ]; then
+          # 成功数小于3，说明当前启动的UP节点异常，开始启动本节点
+          set -e
+          # 启动自己的逻辑：因为没有选主逻辑，因此，只有按照pod顺序来
+          # 这里有一个算法：在这个有序的集合（StatefuleSet）中，每一个POD，需要判断自己的pod号，
+          # 如果自己的pod号较大，则必须依次检查前序pod情况，直到检查到自己。
+          # 但是，由于POD号是一个有限数组，比如[0,1,2,3]，因此，我们需要一个方法，能够让每个POD检查的时候，知道当前的检查顺序。
+          # 举个例子：
+          # [0,1,2,3]，假设当前UP的是0，那么1号POD需要检查的就是[]，2好需要检查的是[1]，3号POD需要检查的是[1,2]
+          # 假设当前UP的是2，那么1号POD需要检查的就是[3,0]，3号POD需要检查的是[]，0号需要检查的[3]——（因为这时其实数组成为了[2,3,0,1]，可以仔细想象）
+          # 因此，我们需要一个算法，能够根据当前UP的号数，得到一个有序顺序的号数。
+          # 这里，我们使用一个next方法，然后按照“进位”的思想，来获得next号数
+          tmp=${up_pod}
+          cur_pod=${POD_NAME:0-1}
+          echo "记录的UP节点：${up_pod}"
+          echo "当前节点：${cur_pod}"
+          next() {
+              step_over={{ .Values.replicaCount }}  # 用于进位
+              cur=${1}
+              out=$((${cur}+1))
+              if [ ${out} -eq ${step_over} ]; then
+                  return 0
+              else
+                  return $((0+${out}))
+              fi
+          }
+
+          # 这个for循环也是一个算法，就是循环n次，按照next得到的有序数组进行处理。当处理到当前号数的时候，停止处理
+          for m in `seq {{ .Values.replicaCount }}`; do
+            set +e
+            next ${tmp} # 获取下一个有序号数
+            tmp=${?} # 将返回的有序号数设置到当前变量，应用于下一次循环
+            set -e
+            if [ ${tmp} -eq ${cur_pod} ]; then
+                # 到这里，说明当前节点前序检查结束，没有一个是UP节点，跳出while（见while done之后的内容）
+                echo "当前节点${cur_pod}号，前序检查结束，启动自己的nexus"
+                break 2 # 如果当前需要检查的号数就是自己的号数，说明前面号数已经检查过，并且都没有检查成功，则不检查了，启动自己
+            fi
+            echo "当前节点${cur_pod}号，检查${tmp}号"
+            # 一个nexus启动，预计需要40秒。因此，以此为检查周期
+            # 一次check耗时5秒, 8次40秒，这里多check一段时间
+            for n in `seq 12`; do
+              set +e
+              check_status_from ${tmp} # 对tmp这个号数进行检查。
+              if [ $? -eq 0 ]; then
+                set -e
+                # 如果检查到一个POD已经启动，则以此号数为目标进行stand_by，同时需要清除掉之前stand_by的数据
+                up_pod=${tmp}
+                rm -fr {{ .Values.nexus.persistence.mountPath }}/*
+                # 但是这两个文件需要保留
+                echo "initialed" > {{ .Values.nexus.persistence.mountPath }}/_initial
+                echo "STANDBY" > {{ .Values.nexus.persistence.mountPath }}/pod_status
+                break 2 # 跳出外层循环
+              fi
+              set -e
+            done
+          done
+        else
+          echo "成功检查${up_pod}节点状态，从${up_pod}节点同步数据"
+          sync_data_from ${up_pod}
+        fi
+        sleep 2
+      done
+
+      # 到这里，说明当前节点前序检查结束，没有一个是UP节点，因此启动自己
+      echo -e '[{"op": "replace", "path": "/metadata/labels/status", "value": "UP"}]' > /root/patch_lable.json
+      curl -s --cacert ${CACERT} --header "Authorization: Bearer ${TOKEN}" -X GET ${APISERVER}/api/v1/namespaces/${POD_NAMESPACE}/pods/${POD_NAME} --data "$(cat /root/patch_lable.json)"  --request PATCH -H "Content-Type:application/json-patch+json"
+      echo "UP" > {{ .Values.nexus.persistence.mountPath }}/pod_status
+      echo "启动rsync同步服务."
+      rsync --daemon --config=/root/rsync.conf
+      netstat -anpo |  grep -v grep | grep {{ .Values.nexus.rsync.port }}
+      while true; do sleep 5; done
+    }
+
+    set -e
+
+    podnumber=${POD_NAME:0-1}
+    if [ "`expr $podnumber + 1`" -gt "{{ .Values.replicaCount }}" ]; then
+      echo "启动数量超出集群数量设置：{{ .Values.replicaCount }}, 不能启动"
+      exit 1
+    fi
+
+    port={{ .Values.nexus.port }}
+    export APISERVER=https://kubernetes.default.svc
+    export SERVICEACCOUNT=/var/run/secrets/kubernetes.io/serviceaccount
+    export TOKEN=$(cat ${SERVICEACCOUNT}/token)
+    export CACERT=${SERVICEACCOUNT}/ca.crt
+
+    # 启动逻辑
+    if [ -f {{ .Values.nexus.persistence.mountPath }}/_initial ]; then
+      # 如果是重启，根据检测情况执行
+      echo "发生重启，重置pod_status为STANDBY"
+      time=0
+      while [ ${time} -gt 10 ]; do
+        # 重启后，无论如何，先把自己设定为standby。这里使用while加时间的原因是，run.sh中重启后会删除pod_status，由于这里没必要加锁执行，因此直接选择了多次重试，以便跳过删除导致的多进程并发错误
+        echo "STANDBY" > {{ .Values.nexus.persistence.mountPath }}/pod_status
+        sleep 0.5 && "let time++"
+      done
+      # 检查其他节点是否是启动状态。如果是，则将本节点历史数据删除掉，并启动同步
+      # 如果检测不到，则一直检测。这样，如果全面宕机，则手动制定一个节点为UP就行了。其方法就是手动修改pod_status文件状态
+      up_pod=-1
+      while true; do
+        # 循环POD数量，判断哪一个节点是启动状态。直到找到一个后，启动同步服务
+        for i in `seq {{ .Values.replicaCount }}`
+        do
+          target={{ include "nexus.fullname" . }}-$((${i}-1)).{{ include "nexus.headless" . }}
+          echo "检查${target}对应的nexus服务"
+          result=$(curl --connect-timeout 1 -I http://${target}:${port} | grep 200 |wc -l)
+          if [ "${result}" -eq 1 ]; then
+            up_pod=$((${i}-1))
+            # 检查到其中一个节点是启动状态
+            if [ "${up_pod}" -eq "${podnumber}" ]; then
+              # 如果启动的节点就是自己，则将自己标记为启动
+              echo -e '[{"op": "replace", "path": "/metadata/labels/status", "value": "UP"}]' > /root/patch_lable.json
+              curl -s --cacert ${CACERT} --header "Authorization: Bearer ${TOKEN}" -X GET ${APISERVER}/api/v1/namespaces/${POD_NAMESPACE}/pods/${POD_NAME} --data "$(cat /root/patch_lable.json)"  --request PATCH -H "Content-Type:application/json-patch+json"
+              echo "UP" > {{ .Values.nexus.persistence.mountPath }}/pod_status
+            else
+              # 如果自己不是启动节点，则StandBy
+              echo -e '[{"op": "replace", "path": "/metadata/labels/status", "value": "STANDBY"}]' > /root/patch_lable.json
+              curl -s --cacert ${CACERT} --header "Authorization: Bearer ${TOKEN}" -X GET ${APISERVER}/api/v1/namespaces/${POD_NAMESPACE}/pods/${POD_NAME} --data "$(cat /root/patch_lable.json)"  --request PATCH -H "Content-Type:application/json-patch+json"
+              # 由于需要重新同步，因此删除所有数据
+              rm -fr {{ .Values.nexus.persistence.mountPath }}/*
+              echo "initialed" > {{ .Values.nexus.persistence.mountPath }}/_initial
+              echo "STANDBY" > {{ .Values.nexus.persistence.mountPath }}/pod_status
+            fi
+            break 2
+          fi
+        done
+        sleep 2
+      done
+      # 开始同步数据
+      if [ $(cat {{ .Values.nexus.persistence.mountPath }}/pod_status) == "STANDBY" ]; then
+        stand_by_from ${up_pod}
+      else
+        echo "启动rsync同步服务."
+        rsync --daemon --config=/root/rsync.conf
+        netstat -anpo |  grep -v grep | grep {{ .Values.nexus.rsync.port }}
+        while true; do sleep 5; done
+      fi
+    else
+      # 执行初始化，创建需要的内容
+      if [ $podnumber = "0" ]; then
+        WAIT=10
+        RETRY_TIMES=0
+        while [ ${RETRY_TIMES} -lt 10 ]; do
+          let "RETRY_TIMES++" && sleep ${WAIT}
+          result=$(curl --connect-timeout 1 -I http://127.0.0.1:${port} | grep 200 |wc -l)
+          if [ "${result}" -eq 1 ]; then
+            echo "nexus已启动"
+            break;
+          else
+            if [ ${RETRY_TIMES} -eq 10 ]; then
+              echo "重试10次，没有检测到nexus启动。退出"
+              exit 1
+            fi
+          fi
+        done
+
+        # 主节点初始化。
+        if [ -f {{ .Values.nexus.persistence.mountPath }}/admin.password ]; then
+          echo "通过/nexus-data/admin.password 获取初始密码"
+          adminpwd=$(cat {{ .Values.nexus.persistence.mountPath }}/admin.password)
+
+          echo "使用接口初始化nexus"
+          echo "1、修改admin密码"
+          curl -X PUT "http://127.0.0.1:${port}/service/rest/beta/security/users/admin/change-password" -u admin:${adminpwd} -H "accept: application/json" -H "Content-Type: text/plain" -d "admin"
+
+          echo "2、创建需要的用户"
+          user=sobey
+          password=SobeyHive2016
+          curl -X POST "http://127.0.0.1:${port}/service/rest/beta/security/users/admin/change-password" -u admin:admin -H "accept: application/json" -H "Content-Type: application/json" -d "{ \"userId\": \"${user}\", \"firstName\": \"${user}\", \"lastName\": \"${user}\", \"emailAddress\": \"${user}@sboey.com\", \"password\": \"${password}\", \"status\": \"active\", \"roles\": [ \"nx-admin\" ]}"
+
+          echo "3、设置可匿名访问"
+          curl -X PUT "http://127.0.0.1:${port}/service/rest/beta/security/anonymous" -H "accept: application/json" -H "Content-Type: application/json" -d "{ \"enabled\": true, \"userId\": \"anonymous\", \"realmName\": \"NexusAuthorizingRealm\"}"
+
+          {{- if eq .Values.nexus.persistence.blob.storageType (index .Values.nexus.persistence.blob.typeEnum 1)}}
+          echo "4、创建S3 Blob存储"
+          s3ak={{ .Values.nexus.persistence.blob.minio.accessKey | quote }}
+          s3sk={{ .Values.nexus.persistence.blob.minio.secretKey | quote }}
+          s3region={{ .Values.nexus.persistence.blob.minio.region | quote }}
+          s3endpoint={{ .Values.nexus.persistence.blob.minio.regionendpoint | quote }}
+          buketMaven={{ .Values.nexus.persistence.blob.minio.bucketMaven | quote }}
+          buketPy={{ .Values.nexus.persistence.blob.minio.bucketPy }}
+          curl -X POST "http://127.0.0.1:${port}/service/rest/v1/blobstores/s3" -u admin:admin -H "accept: application/json" -H "Content-Type: application/json" -d "{ \"name\": \"${buketMaven}\", \"softQuota\": null, \"bucketConfiguration\": { \"bucket\": { \"region\": \"${s3region}\", \"name\": \"${buketMaven}\", \"prefix\": \"\", \"expiration\": 1 }, \"bucketSecurity\": { \"accessKeyId\": \"${s3ak}\", \"secretAccessKey\": \"${s3sk}\", \"role\": \"\", \"sessionToken\": \"\" }, \"advancedBucketConnection\": { \"endpoint\": \"${s3endpoint}\", \"signerType\": \"S3SignerType\", \"forcePathStyle\": true } }}"
+          curl -X POST "http://127.0.0.1:${port}/service/rest/v1/blobstores/s3" -u admin:admin -H "accept: application/json" -H "Content-Type: application/json" -d "{ \"name\": \"${buketPy}\", \"softQuota\": null, \"bucketConfiguration\": { \"bucket\": { \"region\": \"${s3region}\", \"name\": \"${buketPy}\", \"prefix\": \"\", \"expiration\": 1 }, \"bucketSecurity\": { \"accessKeyId\": \"${s3ak}\", \"secretAccessKey\": \"${s3sk}\", \"role\": \"\", \"sessionToken\": \"\" }, \"advancedBucketConnection\": { \"endpoint\": \"${s3endpoint}\", \"signerType\": \"S3SignerType\", \"forcePathStyle\": true } }}"
+          {{- else }}
+          echo "4、创建File Blob存储"
+          buketMaven={{ .Values.nexus.persistence.blob.minio.bucketMaven | quote }}
+          buketPy={{ .Values.nexus.persistence.blob.minio.bucketPy | quote }}
+          curl -X POST "http://127.0.0.1:${port}/service/rest/v1/blobstores/file" -u admin:admin -H "accept: application/json" -H "Content-Type: application/json" -d "{ \"softQuota\": null, \"path\": \"{{ .Values.nexus.persistence.mountPath }}/blobs/${buketMaven}\", \"name\": \"${buketMaven}\"}"
+          curl -X POST "http://127.0.0.1:${port}/service/rest/v1/blobstores/file" -u admin:admin -H "accept: application/json" -H "Content-Type: application/json" -d "{ \"softQuota\": null, \"path\": \"{{ .Values.nexus.persistence.mountPath }}/blobs/${buketPy}\", \"name\": \"${buketPy}\"}"
+          {{- end }}
+
+          echo "创建maven hosted"
+          reponamehosted={{ .Values.nexus.managedRepo.java.local | quote }}
+          curl -X POST "http://127.0.0.1:${port}/service/rest/beta/repositories/maven/hosted" -u admin:admin -H "accept: application/json" -H "Content-Type: application/json" -d "{ \"name\": \"${reponamehosted}\", \"online\": true, \"storage\": { \"blobStoreName\": \"${buketMaven}\", \"strictContentTypeValidation\": true, \"writePolicy\": \"allow_once\" }, \"cleanup\": { \"policyNames\": [] }, \"maven\": { \"versionPolicy\": \"MIXED\", \"layoutPolicy\": \"STRICT\" }}"
+
+          echo "创建maven proxy"
+          reponameproxy={{ .Values.nexus.managedRepo.java.proxy.name | quote }}
+          proxyurl={{ .Values.nexus.managedRepo.java.proxy.url | quote }}
+          curl -X POST "http://127.0.0.1:${port}/service/rest/beta/repositories/maven/proxy" -u admin:admin -H "accept: application/json" -H "Content-Type: application/json" -d "{ \"name\": \"${reponameproxy}\", \"online\": true, \"storage\": { \"blobStoreName\": \"${buketMaven}\", \"strictContentTypeValidation\": true }, \"cleanup\": { \"policyNames\": [] }, \"proxy\": { \"remoteUrl\": \"${proxyurl}\", \"contentMaxAge\": 1440, \"metadataMaxAge\": 1440 }, \"negativeCache\": { \"enabled\": true, \"timeToLive\": 1440 }, \"httpClient\": { \"blocked\": false, \"autoBlock\": true, \"connection\": null, \"authentication\": null }, \"routingRule\": null, \"maven\": { \"versionPolicy\": \"MIXED\", \"layoutPolicy\": \"STRICT\" }}"
+
+          echo "创建maven group"
+          reponame={{ .Values.nexus.managedRepo.java.group | quote }}
+          curl -X POST "http://127.0.0.1:${port}/service/rest/beta/repositories/maven/group" -u admin:admin -H "accept: application/json" -H "Content-Type: application/json" -d "{ \"name\": \"${reponame}\", \"online\": true, \"storage\": { \"blobStoreName\": \"${buketMaven}\", \"strictContentTypeValidation\": true }, \"group\": { \"memberNames\": [ \"${reponamehosted}\", \"${reponameproxy}\" ] }}"
+
+          echo "创建hosted pypi"
+          reponamehosted={{ .Values.nexus.managedRepo.python.local | quote }}
+          curl -X POST "http://127.0.0.1:${port}/service/rest/beta/repositories/pypi/hosted" -u admin:admin -H "accept: application/json" -H "Content-Type: application/json" -d "{ \"name\": \"${reponamehosted}\", \"online\": true, \"storage\": { \"blobStoreName\": \"${buketPy}\", \"strictContentTypeValidation\": true, \"writePolicy\": \"allow_once\" }, \"cleanup\": { \"policyNames\": [] }}"
+
+          echo "创建proxy pypi"
+          reponameproxy={{ .Values.nexus.managedRepo.python.proxy.name | quote }}
+          proxyurl={{ .Values.nexus.managedRepo.python.proxy.url | quote }}
+          curl -X POST "http://127.0.0.1:${port}/service/rest/beta/repositories/pypi/proxy" -u admin:admin -H "accept: application/json" -H "Content-Type: application/json" -d "{ \"name\": \"${reponameproxy}\", \"online\": true, \"storage\": { \"blobStoreName\": \"${buketPy}\", \"strictContentTypeValidation\": true }, \"cleanup\": { \"policyNames\": [] }, \"proxy\": { \"remoteUrl\": \"${proxyurl}\", \"contentMaxAge\": 1440, \"metadataMaxAge\": 1440 }, \"negativeCache\": { \"enabled\": true, \"timeToLive\": 1440 }, \"httpClient\": { \"blocked\": false, \"autoBlock\": true, \"connection\": null, \"authentication\": null }, \"routingRule\": null}"
+
+          echo "创建pypi group"
+          reponame={{ .Values.nexus.managedRepo.python.group | quote }}
+          curl -X POST "http://127.0.0.1:${port}/service/rest/beta/repositories/pypi/group" -u admin:admin -H "accept: application/json" -H "Content-Type: application/json" -d "{ \"name\": \"${reponame}\", \"online\": true, \"storage\": { \"blobStoreName\": \"${buketPy}\", \"strictContentTypeValidation\": true }, \"group\": { \"memberNames\": [ \"${reponamehosted}\", \"${reponameproxy}\" ] }}"
+        else
+          echo "主节点已经初始化过"
+        fi
+
+        echo "启动rsync同步服务."
+        rsync --daemon --config=/root/rsync.conf
+        netstat -anpo |  grep -v grep | grep {{ .Values.nexus.rsync.port }}
+
+        echo "主节点执行标签设定"
+        echo -e '[{"op": "replace", "path": "/metadata/labels/status", "value": "UP"}]' > /root/patch_lable.json
+        result=$(curl -s --cacert ${CACERT} --header "Authorization: Bearer ${TOKEN}" -X GET ${APISERVER}/api/v1/namespaces/${POD_NAMESPACE}/pods/${POD_NAME} --data "$(cat /root/patch_lable.json)"  --request PATCH -H "Content-Type:application/json-patch+json")
+
+        echo "UP" > {{ .Values.nexus.persistence.mountPath }}/pod_status
+        echo "initialed" > {{ .Values.nexus.persistence.mountPath }}/_initial
+        while true; do sleep 5; done
+      else
+        # 如果是从节点，
+        echo "从节点启动，执行STANDBY操作"
+        # 1、设置自己的标签为status=STANDBY
+        echo -e '[{"op": "replace", "path": "/metadata/labels/status", "value": "STANDBY"}]' > /root/patch_lable.json
+        curl -s --cacert ${CACERT} --header "Authorization: Bearer ${TOKEN}" -X GET ${APISERVER}/api/v1/namespaces/${POD_NAMESPACE}/pods/${POD_NAME} --data "$(cat /root/patch_lable.json)"  --request PATCH -H "Content-Type:application/json-patch+json"
+        echo "STANDBY" > {{ .Values.nexus.persistence.mountPath }}/pod_status
+        # 2、从主节点同步数据
+        echo "initialed" > {{ .Values.nexus.persistence.mountPath }}/_initial
+        echo "stand_by_from 0"
+        stand_by_from 0
+      fi
+    fi
+  # 状态检测脚本
+  check_info.sh: |-
+    #!/bin/bash
+
+    if [ ! -f {{ .Values.nexus.persistence.mountPath }}/_initial ]; then
+      echo "没有获取到{{ .Values.nexus.persistence.mountPath }}/_initial文件" 1>&2
+      exit 1
+    fi
+    if [ ! -f {{ .Values.nexus.persistence.mountPath }}/pod_status ]; then
+      echo "没有获取到{{ .Values.nexus.persistence.mountPath }}/pod_status文件" 1>&2
+      exit 1
+    fi
+    if [ $(cat {{ .Values.nexus.persistence.mountPath }}/pod_status) == "UP" ]; then
+      result=$(curl --connect-timeout 1 -I http://127.0.0.1:{{ .Values.nexus.port }} | grep 200 |wc -l)
+      if [ ! "${result}" -eq 1 ]; then
+        echo "nexus服务curl失败" 1>&2
+        exit 1
+      fi
+    fi

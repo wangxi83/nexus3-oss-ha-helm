@@ -1,0 +1,28 @@
+{{/* @see StatefulSet.spec.template.spec.serviceAccountName */}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ printf "%s%s" ( include "nexus.fullname" . ) "-apiuser"  }}
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ printf "%s%s" ( include "nexus.fullname" . ) "-cluster-role"  }}
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "watch", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ printf "%s%s" ( include "nexus.fullname" . ) "-cluster-role-binding"  }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ printf "%s%s" ( include "nexus.fullname" . ) "-cluster-role"  }}
+subjects:
+- kind: ServiceAccount
+  name: {{ printf "%s%s" ( include "nexus.fullname" . ) "-apiuser"  }}
+  namespace: {{ .Release.Namespace }}
